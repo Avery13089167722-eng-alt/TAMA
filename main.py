@@ -124,7 +124,8 @@ class TongueApp(MDApp):
         self.dialog = None
 
         self.config_data = self._load_config()
-        self.storage = LocalStorage(self.config_data.get("db_path", "tongue_records.db"))
+        db_path = self._resolve_db_path(self.config_data.get("db_path", "tongue_records.db"))
+        self.storage = LocalStorage(db_path)
         self.api_client = LLMApiClient(
             base_url=self.config_data.get("api_base_url", "http://8.160.184.31:8001"),
             api_path=self.config_data.get("api_path", "/v1/tongue-analyze"),
@@ -417,23 +418,60 @@ class TongueApp(MDApp):
                 self._append_chat_message("assistant", rec.get("full_result") or "")
 
     def _load_config(self):
-        config_path = Path(CONFIG_FILE)
-        if not config_path.exists():
-            default = {
-                "api_base_url": "http://8.160.184.31:8001",
-                "api_path": "/v1/tongue-analyze",
-                "api_timeout": 90,
-                "api_token": "",
-                "retry_count": 2,
-                "retry_backoff_sec": 1.5,
-                "db_path": "tongue_records.db",
-            }
-            config_path.write_text(json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8")
-            return default
+        default = {
+            "api_base_url": "http://8.160.184.31:8001",
+            "api_path": "/v1/tongue-analyze",
+            "text_api_path": "/v1/text-chat",
+            "api_timeout": 90,
+            "api_token": "",
+            "retry_count": 2,
+            "retry_backoff_sec": 1.5,
+            "db_path": "tongue_records.db",
+        }
+
+        runtime_config_path = self._resolve_runtime_config_path()
+        bundled_config_path = Path(CONFIG_FILE)
+
+        # 优先读取可写目录内配置（Android 上避免读取 APK 内只读文件）。
+        if runtime_config_path.exists():
+            try:
+                return json.loads(runtime_config_path.read_text(encoding="utf-8"))
+            except Exception:
+                return default
+
+        # 首次启动：尝试从项目配置文件复制；失败则使用默认配置。
+        config_data = default
+        if bundled_config_path.exists():
+            try:
+                config_data = json.loads(bundled_config_path.read_text(encoding="utf-8"))
+            except Exception:
+                config_data = default
+
         try:
-            return json.loads(config_path.read_text(encoding="utf-8"))
+            runtime_config_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime_config_path.write_text(
+                json.dumps(config_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         except Exception:
-            return {}
+            # 写入失败时仍返回可用配置，避免启动崩溃。
+            pass
+        return config_data
+
+    def _resolve_runtime_config_path(self) -> Path:
+        # Android 下统一放在 user_data_dir；桌面端保持项目目录行为。
+        if platform == "android":
+            return Path(self.user_data_dir) / CONFIG_FILE
+        return Path(CONFIG_FILE)
+
+    def _resolve_db_path(self, db_path: str) -> str:
+        p = Path(db_path)
+        if p.is_absolute():
+            return str(p)
+        # Android 下相对路径映射到可写目录，避免 sqlite 在只读目录创建失败。
+        if platform == "android":
+            return str(Path(self.user_data_dir) / p.name)
+        return str(p)
 
     def pick_image(self):
         chooser = FileChooserListView(
