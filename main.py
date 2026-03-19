@@ -1,7 +1,9 @@
 import json
 import os
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -15,12 +17,14 @@ os.environ.setdefault("SDL_HINT_IME_SHOW_UI", "1")
 from kivy.config import Config
 from kivy.core.window import Window
 from kivy.metrics import dp
+from kivy.utils import platform
 
 # 桌面本机调试时，强制使用系统键盘/IME，提升中文输入可用性。
-Config.set("kivy", "keyboard_mode", "system")
+# Android 上不强制该参数，避免部分设备出现输入子系统兼容问题。
+if platform != "android":
+    Config.set("kivy", "keyboard_mode", "system")
 
 from kivy.clock import Clock
-from kivy.utils import platform
 from kivy.lang import Builder
 from kivy.properties import BooleanProperty, StringProperty
 from kivy.core.text import LabelBase
@@ -53,6 +57,28 @@ except Exception:
 
 KV_FILE = "ui.kv"
 CONFIG_FILE = "app_config.json"
+CRASH_LOG_FILE = "last_crash.log"
+
+
+def _write_crash_log(exc_type, exc_value, exc_tb):
+    """记录未捕获异常，便于定位 Android 闪退。"""
+    try:
+        content = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        crash_path = Path(CRASH_LOG_FILE)
+        try:
+            from kivy.app import App
+            app = App.get_running_app()
+            if app and getattr(app, "user_data_dir", ""):
+                crash_path = Path(app.user_data_dir) / CRASH_LOG_FILE
+        except Exception:
+            pass
+        crash_path.parent.mkdir(parents=True, exist_ok=True)
+        crash_path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+sys.excepthook = _write_crash_log
 
 
 class HistoryItem(TwoLineAvatarIconListItem):
@@ -185,7 +211,6 @@ class TongueApp(MDApp):
                 "CAMERA",
                 "READ_MEDIA_IMAGES",      # Android 13+
                 "READ_EXTERNAL_STORAGE",  # Android 12 及以下
-                "WRITE_EXTERNAL_STORAGE",
             ]
             runtime_perms = []
             for perm_name in permission_names:
