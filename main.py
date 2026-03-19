@@ -812,6 +812,10 @@ class TongueApp(MDApp):
         try:
             uri = intent.getData()
             if uri is None:
+                clip = intent.getClipData()
+                if clip is not None and clip.getItemCount() > 0:
+                    uri = clip.getItemAt(0).getUri()
+            if uri is None:
                 self._snack("选择图片失败，请重试")
                 return
             try:
@@ -834,6 +838,24 @@ class TongueApp(MDApp):
         self.has_image_preview = True
         self._update_analyze_button()
         self._snack("图片加载成功")
+
+    def _stage_image_for_upload(self, source_path: str) -> str:
+        """统一把待上传图片落地到 app 私有目录，避免临时路径/URI 失效。"""
+        local = self._ensure_local_image_path(source_path)
+        if not local or not os.path.exists(local):
+            return ""
+        try:
+            src = Path(local)
+            suffix = src.suffix.lower() if src.suffix else ".jpg"
+            upload_dir = Path(self.user_data_dir) / "uploads"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            staged = upload_dir / f"upload_{int(time.time() * 1000)}{suffix}"
+            shutil.copy2(str(src), str(staged))
+            if staged.exists() and staged.stat().st_size > 0:
+                return str(staged)
+            return ""
+        except Exception:
+            return ""
 
     def _apply_android_camera_result(self, result_code: int, intent):
         self._set_loading(False)
@@ -910,12 +932,12 @@ class TongueApp(MDApp):
         user_text = self.root.ids.note_input.text.strip()
         has_image = bool(self.selected_image_path)
         if has_image:
-            # 发送前再次确保图片是可读本地文件，避免 content/临时路径导致 Errno2。
-            repaired = self._ensure_local_image_path(self.selected_image_path)
-            if not repaired or not os.path.exists(repaired):
+            # 发送前统一拷贝到上传暂存目录，避免路径失效导致上传失败。
+            staged = self._stage_image_for_upload(self.selected_image_path)
+            if not staged:
                 self._snack("图片路径失效，请重新选择图片后再发送")
                 return
-            self.selected_image_path = repaired
+            self.selected_image_path = staged
 
         if not has_image and not user_text:
             self._snack("请输入问题，或先选择/拍摄舌象图片")

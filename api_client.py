@@ -1,5 +1,6 @@
 from typing import Dict, Optional
 import os
+import mimetypes
 
 import requests
 
@@ -35,8 +36,14 @@ class LLMApiClient:
             "max_new_tokens": "512",
         }
         url = f"{self.base_url}{self.api_path}"
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"image file not found: {image_path}")
+        if os.path.getsize(image_path) <= 0:
+            raise FileNotFoundError(f"image file empty: {image_path}")
+        mime, _ = mimetypes.guess_type(image_path)
+        mime = mime or "application/octet-stream"
         with open(image_path, "rb") as f:
-            files = {"file": (os.path.basename(image_path), f, "application/octet-stream")}
+            files = {"file": (os.path.basename(image_path), f, mime)}
             resp = requests.post(url, data=form_data, files=files, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
