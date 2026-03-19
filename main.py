@@ -683,11 +683,8 @@ class TongueApp(MDApp):
     def _required_android_perms_for_capture(self):
         if not Permission:
             return []
-        names = [
-            "CAMERA",
-            "READ_MEDIA_IMAGES",      # Android 13+
-            "READ_EXTERNAL_STORAGE",  # Android 12 及以下
-        ]
+        # 拍照仅依赖 CAMERA；读图库权限用于选图，不应阻塞拍照入口。
+        names = ["CAMERA"]
         perms = []
         for n in names:
             v = getattr(Permission, n, None)
@@ -716,15 +713,16 @@ class TongueApp(MDApp):
             return
 
         def _cb(_permissions, grants):
-            ok = True
+            # MIUI 上 grants/检查结果可能偶发不一致：回调后以“尝试启动相机”为准。
             try:
                 ok = all(bool(x) for x in grants)
             except Exception:
                 ok = False
-            if ok:
+            if ok or all(self._has_android_perm(p) for p in perms):
                 Clock.schedule_once(lambda *_: on_granted(), 0)
             else:
-                Clock.schedule_once(lambda *_: self._snack("未授予拍照所需权限"), 0)
+                # 仍给一次兜底尝试，避免“明明授权却提示未授权”。
+                Clock.schedule_once(lambda *_: on_granted(), 0.1)
 
         try:
             request_permissions(missing, _cb)
@@ -816,6 +814,14 @@ class TongueApp(MDApp):
             if uri is None:
                 self._snack("选择图片失败，请重试")
                 return
+            try:
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                resolver = PythonActivity.mActivity.getContentResolver()
+                Intent = autoclass("android.content.Intent")
+                take_flags = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                resolver.takePersistableUriPermission(uri, take_flags)
+            except Exception:
+                pass
             source = str(uri.toString())
         except Exception:
             self._snack("选择图片失败，请重试")
