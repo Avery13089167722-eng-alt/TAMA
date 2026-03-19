@@ -71,6 +71,10 @@ try:
     from jnius import autoclass
 except Exception:
     autoclass = None
+try:
+    from jnius import jarray
+except Exception:
+    jarray = None
 
 
 KV_FILE = "ui.kv"
@@ -646,6 +650,8 @@ class TongueApp(MDApp):
         try:
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Uri = autoclass("android.net.Uri")
+            BufferedInputStream = autoclass("java.io.BufferedInputStream")
+            BufferedOutputStream = autoclass("java.io.BufferedOutputStream")
             FileOutputStream = autoclass("java.io.FileOutputStream")
             resolver = PythonActivity.mActivity.getContentResolver()
             uri = Uri.parse(source_path)
@@ -659,13 +665,22 @@ class TongueApp(MDApp):
             ins = resolver.openInputStream(uri)
             if ins is None:
                 return ""
-            outs = FileOutputStream(target)
+            ins = BufferedInputStream(ins)
+            outs = BufferedOutputStream(FileOutputStream(target))
             try:
-                while True:
-                    b = ins.read()
-                    if b == -1:
-                        break
-                    outs.write(b)
+                if jarray is not None:
+                    buf = jarray("b")(8192)
+                    while True:
+                        n = ins.read(buf)
+                        if n == -1:
+                            break
+                        outs.write(buf, 0, n)
+                else:
+                    while True:
+                        b = ins.read()
+                        if b == -1:
+                            break
+                        outs.write(b)
                 outs.flush()
             finally:
                 try:
@@ -830,7 +845,19 @@ class TongueApp(MDApp):
         except Exception:
             self._snack("选择图片失败，请重试")
             return
+        self._set_loading(True, "正在读取图片...")
+        threading.Thread(
+            target=self._resolve_gallery_image_worker,
+            args=(source,),
+            daemon=True,
+        ).start()
+
+    def _resolve_gallery_image_worker(self, source: str):
         local_path = self._ensure_local_image_path(source)
+        Clock.schedule_once(lambda *_: self._finish_gallery_pick(local_path), 0)
+
+    def _finish_gallery_pick(self, local_path: str):
+        self._set_loading(False)
         if not local_path:
             self._snack("选择失败，请换一张图片重试")
             return
