@@ -34,8 +34,11 @@ jobs:
             zip \
             unzip \
             autoconf \
+            automake \
             libtool \
+            libltdl-dev \
             pkg-config \
+            m4 \
             zlib1g-dev \
             libncurses6 \
             libtinfo6 \
