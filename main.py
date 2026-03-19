@@ -92,10 +92,14 @@ class TongueApp(MDApp):
         if not cjk_font:
             return
         # 全局覆盖 Kivy/KivyMD 默认文本字体，修复中文显示为方块/乱码。
-        LabelBase.register(name="Roboto", fn_regular=cjk_font)
-        LabelBase.register(name="RobotoThin", fn_regular=cjk_font)
-        LabelBase.register(name="RobotoLight", fn_regular=cjk_font)
-        LabelBase.register(name="RobotoMedium", fn_regular=cjk_font)
+        try:
+            LabelBase.register(name="Roboto", fn_regular=cjk_font)
+            LabelBase.register(name="RobotoThin", fn_regular=cjk_font)
+            LabelBase.register(name="RobotoLight", fn_regular=cjk_font)
+            LabelBase.register(name="RobotoMedium", fn_regular=cjk_font)
+        except Exception:
+            # 字体注册失败时不应阻塞应用启动（尤其是 Android 机型差异）。
+            pass
 
     def build(self):
         # 桌面端：大屏但不全屏；Android 端由系统/打包参数控制。
@@ -175,13 +179,24 @@ class TongueApp(MDApp):
 
     def on_start(self):
         if platform == "android" and request_permissions and Permission:
-            request_permissions(
-                [
-                    Permission.CAMERA,
-                    Permission.READ_EXTERNAL_STORAGE,
-                    Permission.WRITE_EXTERNAL_STORAGE,
-                ]
-            )
+            # Android 各版本权限常量并不完全一致，动态探测后再请求，避免启动闪退。
+            permission_names = [
+                "CAMERA",
+                "READ_MEDIA_IMAGES",      # Android 13+
+                "READ_EXTERNAL_STORAGE",  # Android 12 及以下
+                "WRITE_EXTERNAL_STORAGE",
+            ]
+            runtime_perms = []
+            for perm_name in permission_names:
+                perm_value = getattr(Permission, perm_name, None)
+                if perm_value and perm_value not in runtime_perms:
+                    runtime_perms.append(perm_value)
+            try:
+                if runtime_perms:
+                    request_permissions(runtime_perms)
+            except Exception:
+                # 权限请求失败不影响主界面启动，避免“打开几秒后闪退”。
+                pass
         # 不自动加载历史到聊天栏：避免“未发送就会滚动”的初始化抖动问题。
         # 监听输入内容变化：允许“仅文本咨询”。
         if "note_input" in self.root.ids:
