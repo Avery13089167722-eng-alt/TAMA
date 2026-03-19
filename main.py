@@ -60,6 +60,16 @@ except Exception:
     request_permissions = None
     check_permission = None
 
+try:
+    from android import activity as android_activity
+except Exception:
+    android_activity = None
+
+try:
+    from jnius import autoclass
+except Exception:
+    autoclass = None
+
 
 KV_FILE = "ui.kv"
 CONFIG_FILE = "app_config.json"
@@ -192,6 +202,8 @@ class TongueApp(MDApp):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._msg_meta = {}
+        self._camera_request_code = 4721
+        self._android_camera_bound = False
 
     def _on_mouse_scroll(self, _window, _x, _y, _scroll_x, scroll_y):
         # 桌面端：兜底实现鼠标滚轮上下滚动查看（避免某些环境 ScrollView 不响应）。
@@ -235,6 +247,17 @@ class TongueApp(MDApp):
             self.root.ids.note_input.bind(text=lambda *_: self._update_analyze_button())
         self._update_analyze_button()
         # 取消自动滚动：用户手动滚动后不再被程序强制拉回底部。
+        if platform == "android":
+            self._bind_android_activity_result()
+
+    def _bind_android_activity_result(self):
+        if self._android_camera_bound or android_activity is None:
+            return
+        try:
+            android_activity.bind(on_activity_result=self._on_android_activity_result)
+            self._android_camera_bound = True
+        except Exception:
+            self._android_camera_bound = False
 
     def _update_analyze_button(self):
         has_image = bool(self.selected_image_path)
@@ -556,14 +579,64 @@ class TongueApp(MDApp):
             self._snack("未选择图片")
             return
         try:
-            picked = selection[0]
+            picked = str(selection[0])
         except Exception:
             self._snack("选择图片失败")
             return
-        self.selected_image_path = str(picked)
+        local_path = self._ensure_local_image_path(picked)
+        if not local_path:
+            self._snack("图片读取失败，请换一张图片重试")
+            return
+        self.selected_image_path = local_path
         self.has_image_preview = True
         self._update_analyze_button()
         self._snack("图片加载成功")
+
+    def _ensure_local_image_path(self, source_path: str) -> str:
+        if not source_path:
+            return ""
+        # 普通文件路径直接使用
+        if source_path.startswith("/") or source_path.startswith("file://"):
+            return source_path.replace("file://", "")
+        # 仅 Android 处理 content:// URI
+        if not source_path.startswith("content://") or platform != "android" or autoclass is None:
+            return source_path
+        try:
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Uri = autoclass("android.net.Uri")
+            FileOutputStream = autoclass("java.io.FileOutputStream")
+            resolver = PythonActivity.mActivity.getContentResolver()
+            uri = Uri.parse(source_path)
+            mime = resolver.getType(uri) or ""
+            suffix = ".jpg"
+            if "png" in mime:
+                suffix = ".png"
+            elif "webp" in mime:
+                suffix = ".webp"
+            target_dir = Path(self.user_data_dir) / "picked"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = str(target_dir / f"pick_{int(time.time() * 1000)}{suffix}")
+            ins = resolver.openInputStream(uri)
+            outs = FileOutputStream(target)
+            try:
+                while True:
+                    b = ins.read()
+                    if b == -1:
+                        break
+                    outs.write(b)
+                outs.flush()
+            finally:
+                try:
+                    ins.close()
+                except Exception:
+                    pass
+                try:
+                    outs.close()
+                except Exception:
+                    pass
+            return target
+        except Exception:
+            return ""
 
     def _required_android_perms_for_capture(self):
         if not Permission:
@@ -621,12 +694,17 @@ class TongueApp(MDApp):
         if platform != "android":
             self._snack("拍照功能需在 Android 真机使用")
             return
-        if camera is None:
-            self._snack("未检测到拍照组件，请确认已安装 plyer")
-            return
         self._request_capture_permissions_then(self._do_capture_image)
 
     def _do_capture_image(self):
+        # Android 优先走系统相机 Intent，兼容性高于 plyer.camera。
+        if self._start_android_camera_intent():
+            self._set_loading(True, "正在打开系统相机...")
+            return
+        # 回退到 plyer 拍照方案
+        if camera is None:
+            self._snack("未检测到拍照组件，请确认已安装 plyer")
+            return
         # Android 上写入目录使用 user_data_dir，保证可写且跨设备可用。
         capture_dir = Path(self.user_data_dir) / "captures"
         capture_dir.mkdir(parents=True, exist_ok=True)
@@ -638,6 +716,75 @@ class TongueApp(MDApp):
         except Exception:
             self._set_loading(False)
             self._snack("拍照启动失败，请检查系统相机权限")
+
+    def _start_android_camera_intent(self) -> bool:
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            self._bind_android_activity_result()
+            Intent = autoclass("android.content.Intent")
+            MediaStore = autoclass("android.provider.MediaStore")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+            act = PythonActivity.mActivity
+            if intent.resolveActivity(act.getPackageManager()) is None:
+                return False
+            act.startActivityForResult(intent, self._camera_request_code)
+            return True
+        except Exception:
+            return False
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        if int(request_code) != int(self._camera_request_code):
+            return
+        Clock.schedule_once(lambda *_: self._apply_android_camera_result(int(result_code), intent), 0)
+
+    def _apply_android_camera_result(self, result_code: int, intent):
+        self._set_loading(False)
+        try:
+            Activity = autoclass("android.app.Activity")
+            ok = int(result_code) == int(Activity.RESULT_OK)
+        except Exception:
+            ok = False
+        if not ok or intent is None:
+            self._snack("拍照取消或失败")
+            return
+        path = self._save_camera_thumb_from_intent(intent)
+        if not path:
+            self._snack("拍照结果读取失败，请改用选图")
+            return
+        self.selected_image_path = path
+        self.has_image_preview = True
+        self._update_analyze_button()
+        self._snack("拍照成功，已加载图片")
+
+    def _save_camera_thumb_from_intent(self, intent) -> str:
+        if platform != "android" or autoclass is None or intent is None:
+            return ""
+        try:
+            Bitmap = autoclass("android.graphics.Bitmap")
+            FileOutputStream = autoclass("java.io.FileOutputStream")
+            extras = intent.getExtras()
+            if extras is None:
+                return ""
+            bmp = extras.get("data")
+            if bmp is None:
+                return ""
+            capture_dir = Path(self.user_data_dir) / "captures"
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            target = str(capture_dir / f"cam_{int(time.time() * 1000)}.jpg")
+            outs = FileOutputStream(target)
+            try:
+                bmp.compress(Bitmap.CompressFormat.JPEG, 95, outs)
+                outs.flush()
+            finally:
+                try:
+                    outs.close()
+                except Exception:
+                    pass
+            return target
+        except Exception:
+            return ""
 
     def _on_camera_complete(self, filepath):
         Clock.schedule_once(lambda *_: self._apply_camera_result(filepath), 0)
