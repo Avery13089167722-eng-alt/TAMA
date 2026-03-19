@@ -205,6 +205,7 @@ class TongueApp(MDApp):
         super().__init__(**kwargs)
         self._msg_meta = {}
         self._camera_request_code = 4721
+        self._gallery_request_code = 4722
         self._android_camera_bound = False
 
     def _on_mouse_scroll(self, _window, _x, _y, _scroll_x, scroll_y):
@@ -547,18 +548,22 @@ class TongueApp(MDApp):
 
     def pick_image(self):
         # Android：直接拉起系统相册，用户选择后自动回填。
-        if platform == "android" and filechooser is not None:
-            try:
-                filechooser.open_file(
-                    on_selection=self._on_android_pick_image,
-                    multiple=False,
-                    filters=["*.jpg", "*.jpeg", "*.png", "*.webp"],
-                    use_extensions=True,
-                )
+        if platform == "android":
+            if self._start_android_gallery_intent():
                 return
-            except Exception:
-                self._snack("打开系统相册失败，请重试")
-                return
+            # Intent 失败时兜底用 plyer filechooser
+            if filechooser is not None:
+                try:
+                    filechooser.open_file(
+                        on_selection=self._on_android_pick_image,
+                        multiple=False,
+                        filters=["*.jpg", "*.jpeg", "*.png", "*.webp"],
+                        use_extensions=True,
+                    )
+                    return
+                except Exception:
+                    self._snack("打开系统相册失败，请重试")
+                    return
 
         # 桌面端保留文件选择弹窗。
         chooser = FileChooserListView(
@@ -682,7 +687,6 @@ class TongueApp(MDApp):
             "CAMERA",
             "READ_MEDIA_IMAGES",      # Android 13+
             "READ_EXTERNAL_STORAGE",  # Android 12 及以下
-            "WRITE_EXTERNAL_STORAGE",
         ]
         perms = []
         for n in names:
@@ -771,10 +775,59 @@ class TongueApp(MDApp):
         except Exception:
             return False
 
+    def _start_android_gallery_intent(self) -> bool:
+        if platform != "android" or autoclass is None:
+            return False
+        try:
+            self._bind_android_activity_result()
+            Intent = autoclass("android.content.Intent")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.setType("image/*")
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            chooser = Intent.createChooser(intent, "选择舌象图片")
+            act.startActivityForResult(chooser, self._gallery_request_code)
+            return True
+        except Exception:
+            return False
+
     def _on_android_activity_result(self, request_code, result_code, intent):
-        if int(request_code) != int(self._camera_request_code):
+        rc = int(request_code)
+        if rc == int(self._camera_request_code):
+            Clock.schedule_once(lambda *_: self._apply_android_camera_result(int(result_code), intent), 0)
             return
-        Clock.schedule_once(lambda *_: self._apply_android_camera_result(int(result_code), intent), 0)
+        if rc == int(self._gallery_request_code):
+            Clock.schedule_once(lambda *_: self._apply_android_gallery_result(int(result_code), intent), 0)
+            return
+
+    def _apply_android_gallery_result(self, result_code: int, intent):
+        try:
+            Activity = autoclass("android.app.Activity")
+            ok = int(result_code) == int(Activity.RESULT_OK)
+        except Exception:
+            ok = False
+        if not ok or intent is None:
+            self._snack("未选择图片")
+            return
+        try:
+            uri = intent.getData()
+            if uri is None:
+                self._snack("选择图片失败，请重试")
+                return
+            source = str(uri.toString())
+        except Exception:
+            self._snack("选择图片失败，请重试")
+            return
+        local_path = self._ensure_local_image_path(source)
+        if not local_path:
+            self._snack("选择失败，请换一张图片重试")
+            return
+        self.selected_image_path = local_path
+        self.has_image_preview = True
+        self._update_analyze_button()
+        self._snack("图片加载成功")
 
     def _apply_android_camera_result(self, result_code: int, intent):
         self._set_loading(False)
