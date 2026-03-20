@@ -114,6 +114,10 @@ class TongueApp(MDApp):
         # KivyMD 1.2.0：Snackbar(text=...) 已被弃用，正确做法是传入 MDLabel。
         MDSnackbar(MDLabel(text=str(text))).open()
 
+    def _sanitize_reply_text(self, text: str) -> str:
+        """展示层清理：去掉星号，保持回复更简洁。"""
+        return str(text or "").replace("*", "")
+
     def _resolve_cjk_font(self):
         candidates = [
             Path("assets/fonts/NotoSansSC-Regular.ttc"),
@@ -235,6 +239,11 @@ class TongueApp(MDApp):
         # 取消自动滚动：用户手动滚动后不再被程序强制拉回底部。
         if platform == "android":
             self._bind_android_activity_result()
+        # 首次进入给出简短功能介绍（不涉及“望闻问切”表述）。
+        self._append_chat_message(
+            "assistant",
+            "欢迎使用舌征智析。你可以拍照或选图进行分析，也可以仅输入文字进行咨询。结果会实时显示，并自动保存到本机。",
+        )
 
     def _bind_android_activity_result(self):
         if self._android_camera_bound or android_activity is None:
@@ -348,7 +357,7 @@ class TongueApp(MDApp):
                 label_height = float(label.texture_size[1]) if label.texture_size else 0
                 # 确保高度不为0
                 if label_height <= 0:
-                    label_height = 100  # 设置默认最小高度
+                    label_height = 24 if (label.text or "").strip() else 0
                 # 设置标签高度
                 label.height = label_height
                 # 计算气泡高度
@@ -413,7 +422,7 @@ class TongueApp(MDApp):
         bubble, row, thumb_h, bubble_padding, text_area_width = meta
 
         # 更新文本内容
-        label.text = new_text
+        label.text = self._sanitize_reply_text(new_text)
         label.width = text_area_width
         label.text_size = (text_area_width, None)
 
@@ -1093,7 +1102,7 @@ class TongueApp(MDApp):
 
         # 发消息：先把用户输入展示出来。
         if has_image:
-            user_msg = user_text if user_text else "（仅舌象图片）"
+            user_msg = user_text if user_text else ""
             self._append_chat_message("user", user_msg, image_path=self.selected_image_path)
         else:
             self._append_chat_message("user", user_text)
@@ -1161,7 +1170,7 @@ class TongueApp(MDApp):
         self._set_loading(False)
         answer = str(data.get("answer", "")).strip()
         brief = answer[:40] if answer else "分析完成"
-        full = answer if answer else str(data)
+        full = self._sanitize_reply_text(answer if answer else str(data))
         model_name = str(data.get("model", "ShizhenGPT-7B-VL"))
         confidence = data.get("confidence")
 
