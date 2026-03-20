@@ -226,24 +226,7 @@ class TongueApp(MDApp):
             return False
 
     def on_start(self):
-        if platform == "android" and request_permissions and Permission:
-            # Android 各版本权限常量并不完全一致，动态探测后再请求，避免启动闪退。
-            permission_names = [
-                "CAMERA",
-                "READ_MEDIA_IMAGES",      # Android 13+
-                "READ_EXTERNAL_STORAGE",  # Android 12 及以下
-            ]
-            runtime_perms = []
-            for perm_name in permission_names:
-                perm_value = getattr(Permission, perm_name, None)
-                if perm_value and perm_value not in runtime_perms:
-                    runtime_perms.append(perm_value)
-            try:
-                if runtime_perms:
-                    request_permissions(runtime_perms)
-            except Exception:
-                # 权限请求失败不影响主界面启动，避免“打开几秒后闪退”。
-                pass
+        # 不在启动时弹权限说明；用户点击「拍照 / 选图」时再按需 request_permissions()。
         # 不自动加载历史到聊天栏：避免“未发送就会滚动”的初始化抖动问题。
         # 监听输入内容变化：允许“仅文本咨询”。
         if "note_input" in self.root.ids:
@@ -252,22 +235,6 @@ class TongueApp(MDApp):
         # 取消自动滚动：用户手动滚动后不再被程序强制拉回底部。
         if platform == "android":
             self._bind_android_activity_result()
-            # 首次进入即显式请求拍照/选图所需权限，避免点击拍照才提示未授权。
-            self._request_initial_android_permissions()
-
-    def _request_initial_android_permissions(self):
-        if platform != "android" or request_permissions is None:
-            return
-        perms = self._required_android_perms_for_capture()
-        if not perms:
-            return
-        missing = [p for p in perms if not self._has_android_perm(p)]
-        if not missing:
-            return
-        try:
-            request_permissions(missing)
-        except Exception:
-            pass
 
     def _bind_android_activity_result(self):
         if self._android_camera_bound or android_activity is None:
@@ -546,24 +513,29 @@ class TongueApp(MDApp):
             return str(Path(self.user_data_dir) / p.name)
         return str(p)
 
-    def pick_image(self):
-        # Android：直接拉起系统相册，用户选择后自动回填。
-        if platform == "android":
-            if self._start_android_gallery_intent():
+    def _pick_image_android_after_perm(self):
+        """相册相关权限就绪后，打开系统选图或兜底 filechooser。"""
+        if self._start_android_gallery_intent():
+            return
+        if filechooser is not None:
+            try:
+                filechooser.open_file(
+                    on_selection=self._on_android_pick_image,
+                    multiple=False,
+                    filters=["*.jpg", "*.jpeg", "*.png", "*.webp"],
+                    use_extensions=True,
+                )
                 return
-            # Intent 失败时兜底用 plyer filechooser
-            if filechooser is not None:
-                try:
-                    filechooser.open_file(
-                        on_selection=self._on_android_pick_image,
-                        multiple=False,
-                        filters=["*.jpg", "*.jpeg", "*.png", "*.webp"],
-                        use_extensions=True,
-                    )
-                    return
-                except Exception:
-                    self._snack("打开系统相册失败，请重试")
-                    return
+            except Exception:
+                self._snack("打开系统相册失败，请重试")
+                return
+        self._snack("无法打开相册，请检查系统组件")
+
+    def pick_image(self):
+        # Android：需要读取相册时先走系统权限申请，再打开相册。
+        if platform == "android":
+            self._request_pick_permissions_then(self._pick_image_android_after_perm)
+            return
 
         # 桌面端保留文件选择弹窗。
         chooser = FileChooserListView(
@@ -610,39 +582,95 @@ class TongueApp(MDApp):
         if not local_path:
             self._snack("图片读取失败，请换一张图片重试")
             return
-        self.selected_image_path = local_path
+        self.selected_image_path = (
+            str(Path(local_path).resolve()) if os.path.isfile(local_path) else local_path
+        )
         self.has_image_preview = True
         self._update_analyze_button()
         self._snack("图片加载成功")
+
+    def _normalize_fs_image_path(self, source_path: str) -> str:
+        """统一 file:// 与空白；content:// 原样返回以便后续用 ContentResolver 读取。"""
+        p = (source_path or "").strip()
+        if not p or p.startswith("content://"):
+            return p
+        if p.startswith("file://"):
+            return unquote(p[7:])
+        if platform == "android" and p.startswith("file:"):
+            rest = unquote(p[5:].lstrip("/"))
+            if rest and not rest.startswith("/"):
+                return "/" + rest
+            return rest
+        return p
+
+    def _resolve_readable_local_file(self, source_path: str) -> str:
+        """若指向已存在的非空本地文件，返回规范路径；URI 或无效路径返回空。"""
+        if not source_path:
+            return ""
+        if str(source_path).strip().startswith("content://"):
+            return ""
+        norm = self._normalize_fs_image_path(source_path)
+        for cand in (norm, os.path.realpath(norm) if norm else ""):
+            if not cand:
+                continue
+            try:
+                if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                    return cand
+            except Exception:
+                continue
+        return ""
+
+    def _copy_file_to_upload_dir(self, src_abs: str) -> str:
+        """把已可读的本地文件复制到 uploads/，供 requests 上传。"""
+        src_abs = self._resolve_readable_local_file(src_abs)
+        if not src_abs:
+            return ""
+        try:
+            src = Path(src_abs)
+            suffix = src.suffix.lower() if src.suffix else ".jpg"
+            upload_dir = Path(self.user_data_dir) / "uploads"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            staged = upload_dir / f"upload_{int(time.time() * 1000)}{suffix}"
+            with open(str(src), "rb") as f_src:
+                with open(str(staged), "wb") as f_dst:
+                    shutil.copyfileobj(f_src, f_dst, length=1024 * 1024)
+            if staged.exists() and staged.stat().st_size > 0:
+                return str(staged.resolve())
+            return ""
+        except Exception:
+            return ""
 
     def _ensure_local_image_path(self, source_path: str) -> str:
         if not source_path:
             return ""
         if platform != "android":
-            return source_path.replace("file://", "")
+            return self._normalize_fs_image_path(source_path)
 
         # Android 下统一拷贝到 app 私有目录，规避临时 URI/临时文件失效导致 Errno2。
         target_dir = Path(self.user_data_dir) / "picked"
         target_dir.mkdir(parents=True, exist_ok=True)
-        target = str(target_dir / f"pick_{int(time.time() * 1000)}.jpg")
+
+        raw = self._normalize_fs_image_path(source_path)
 
         # file:// 或绝对路径：直接复制
-        raw = source_path
-        if raw.startswith("file://"):
-            raw = unquote(raw.replace("file://", ""))
-        if raw.startswith("/") and os.path.exists(raw):
-            try:
-                ext = Path(raw).suffix.lower() or ".jpg"
-                final_target = str(target_dir / f"pick_{int(time.time() * 1000)}{ext}")
-                shutil.copy2(raw, final_target)
-                return final_target
-            except Exception:
-                return ""
+        if not raw.startswith("content://"):
+            readable = self._resolve_readable_local_file(raw)
+            base_for_copy = readable or (raw if raw.startswith("/") and os.path.exists(raw) else "")
+            if base_for_copy:
+                try:
+                    ext = Path(base_for_copy).suffix.lower() or ".jpg"
+                    final_target = str(target_dir / f"pick_{int(time.time() * 1000)}{ext}")
+                    shutil.copy2(base_for_copy, final_target)
+                    if os.path.exists(final_target) and os.path.getsize(final_target) > 0:
+                        return str(Path(final_target).resolve())
+                    return ""
+                except Exception:
+                    return ""
 
         # 仅 Android 处理 content:// URI
-        if not source_path.startswith("content://") or autoclass is None:
-            # 兜底：如果路径存在则返回，否则失败
-            return source_path if os.path.exists(source_path) else ""
+        if not raw.startswith("content://") or autoclass is None:
+            # 兜底：若规范化后仍能直接访问
+            return raw if os.path.isfile(raw) and os.path.getsize(raw) > 0 else ""
         try:
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             Uri = autoclass("android.net.Uri")
@@ -650,7 +678,7 @@ class TongueApp(MDApp):
             BufferedOutputStream = autoclass("java.io.BufferedOutputStream")
             FileOutputStream = autoclass("java.io.FileOutputStream")
             resolver = PythonActivity.mActivity.getContentResolver()
-            uri = Uri.parse(source_path)
+            uri = Uri.parse(raw)
             mime = resolver.getType(uri) or ""
             suffix = ".jpg"
             if "png" in mime:
@@ -686,7 +714,7 @@ class TongueApp(MDApp):
                     pass
             # 验证文件是否成功写入
             if os.path.exists(target) and os.path.getsize(target) > 0:
-                return target
+                return str(Path(target).resolve())
             return ""
         except Exception as e:
             import traceback
@@ -715,6 +743,51 @@ class TongueApp(MDApp):
         except Exception:
             return True
 
+    def _required_android_perms_for_pick(self):
+        """选图可能读媒体库；各 Android 版本常量不同，动态探测。"""
+        if not Permission:
+            return []
+        names = [
+            "READ_MEDIA_IMAGES",  # Android 13+
+            "READ_EXTERNAL_STORAGE",
+        ]
+        perms = []
+        for n in names:
+            v = getattr(Permission, n, None)
+            if v and v not in perms:
+                perms.append(v)
+        return perms
+
+    def _request_pick_permissions_then(self, on_granted):
+        """需要读相册时再申请权限：不额外弹出“未开放权限”类话术，仅调用系统对话框。"""
+        if platform != "android" or request_permissions is None:
+            Clock.schedule_once(lambda *_: on_granted(), 0)
+            return
+        perms = self._required_android_perms_for_pick()
+        if not perms:
+            Clock.schedule_once(lambda *_: on_granted(), 0)
+            return
+        missing = [p for p in perms if not self._has_android_perm(p)]
+        if not missing:
+            Clock.schedule_once(lambda *_: on_granted(), 0)
+            return
+
+        def _cb(_permissions, grants):
+            try:
+                ok = all(bool(x) for x in grants)
+            except Exception:
+                ok = False
+            if ok or any(self._has_android_perm(p) for p in perms):
+                Clock.schedule_once(lambda *_: on_granted(), 0)
+            else:
+                # 仍尝试打开（部分机型 GET_CONTENT 可不依赖存储权限）；用户可在系统设置里补授权。
+                Clock.schedule_once(lambda *_: on_granted(), 0.05)
+
+        try:
+            request_permissions(missing, _cb)
+        except Exception:
+            Clock.schedule_once(lambda *_: on_granted(), 0)
+
     def _request_capture_permissions_then(self, on_granted):
         perms = self._required_android_perms_for_capture()
         if not perms or request_permissions is None:
@@ -740,7 +813,8 @@ class TongueApp(MDApp):
         try:
             request_permissions(missing, _cb)
         except Exception:
-            self._snack("权限请求失败，请到系统设置开启相机权限")
+            # 不在此处提示“未授权”；随后仍会尝试打开相机，由系统再弹授权或返回失败。
+            Clock.schedule_once(lambda *_: on_granted(), 0)
 
     def capture_image(self):
         if platform != "android":
@@ -767,7 +841,7 @@ class TongueApp(MDApp):
             camera.take_picture(filename=target, on_complete=self._on_camera_complete)
         except Exception:
             self._set_loading(False)
-            self._snack("拍照启动失败，请检查系统相机权限")
+            self._snack("拍照启动失败，请重试")
 
     def _start_android_camera_intent(self) -> bool:
         if platform != "android" or autoclass is None:
@@ -894,51 +968,27 @@ class TongueApp(MDApp):
         if not local_path:
             self._snack("选择失败，请换一张图片重试")
             return
-        self.selected_image_path = local_path
+        resolved = self._resolve_readable_local_file(local_path) or local_path
+        self.selected_image_path = str(Path(resolved).resolve()) if os.path.isfile(resolved) else local_path
         self.has_image_preview = True
         self._update_analyze_button()
         self._snack("图片加载成功")
 
     def _stage_image_for_upload(self, source_path: str) -> str:
         """统一把待上传图片落地到 app 私有目录，避免临时路径/URI 失效。"""
+        source_path = (source_path or "").strip()
         if not source_path:
             return ""
 
-        # 首先确保图片在本地可访问
+        # 已是可读本地文件时直接拷到 uploads，避免再次 _ensure_local_image_path 失败（如路径含异常前缀）。
+        direct = self._copy_file_to_upload_dir(source_path)
+        if direct:
+            return direct
+
         local = self._ensure_local_image_path(source_path)
         if not local:
-            import traceback
-            traceback.print_exc()
             return ""
-
-        if not os.path.exists(local):
-            return ""
-
-        # 检查文件大小
-        file_size = os.path.getsize(local)
-        if file_size <= 0:
-            return ""
-
-        try:
-            src = Path(local)
-            suffix = src.suffix.lower() if src.suffix else ".jpg"
-            upload_dir = Path(self.user_data_dir) / "uploads"
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            staged = upload_dir / f"upload_{int(time.time() * 1000)}{suffix}"
-
-            # 使用二进制模式复制文件，确保数据完整性
-            with open(str(src), 'rb') as f_src:
-                with open(str(staged), 'wb') as f_dst:
-                    shutil.copyfileobj(f_src, f_dst, length=8192)  # 使用 8KB 缓冲区
-
-            # 验证复制结果
-            if staged.exists() and staged.stat().st_size > 0:
-                return str(staged)
-            return ""
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return ""
+        return self._copy_file_to_upload_dir(local)
 
     def _apply_android_camera_result(self, result_code: int, intent):
         self._set_loading(False)
@@ -954,7 +1004,7 @@ class TongueApp(MDApp):
         # 优先使用预先设置的输出路径
         path = getattr(self, "_camera_output_path", "")
         if path and os.path.exists(path) and os.path.getsize(path) > 0:
-            self.selected_image_path = path
+            self.selected_image_path = str(Path(path).resolve())
             self.has_image_preview = True
             self._update_analyze_button()
             self._snack("拍照成功，已加载图片")
@@ -964,7 +1014,7 @@ class TongueApp(MDApp):
         if intent is not None:
             path = self._save_camera_thumb_from_intent(intent)
             if path:
-                self.selected_image_path = path
+                self.selected_image_path = str(Path(path).resolve())
                 self.has_image_preview = True
                 self._update_analyze_button()
                 self._snack("拍照成功，已加载图片")
@@ -1008,7 +1058,9 @@ class TongueApp(MDApp):
         if not filepath:
             self._snack("拍照取消或失败")
             return
-        self.selected_image_path = filepath
+        self.selected_image_path = (
+            str(Path(filepath).resolve()) if filepath and os.path.isfile(filepath) else filepath
+        )
         self.has_image_preview = True
         self._update_analyze_button()
         self._snack("拍照成功，已加载图片")
