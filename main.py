@@ -661,15 +661,19 @@ class TongueApp(MDApp):
             ins = resolver.openInputStream(uri)
             if ins is None:
                 return ""
-            ins = BufferedInputStream(ins)
-            outs = BufferedOutputStream(FileOutputStream(target))
+            ins = BufferedInputStream(ins, 8192)  # 使用 8KB 缓冲区
+            outs = BufferedOutputStream(FileOutputStream(target), 8192)
             try:
-                # 兼容性优先：避免 jarray 在部分机型/环境抛异常导致读取失败。
+                # 使用批量读取提高效率
+                buffer_size = 8192
+                from jnius import autoclass as jnius_autoclass
+                JArray = jnius_autoclass('java.lang.reflect.Array')
+                buffer = JArray.newInstance(jnius_autoclass('byte'), buffer_size)
                 while True:
-                    b = ins.read()
-                    if b == -1:
+                    bytes_read = ins.read(buffer)
+                    if bytes_read == -1:
                         break
-                    outs.write(b)
+                    outs.write(buffer, 0, bytes_read)
                 outs.flush()
             finally:
                 try:
@@ -680,8 +684,13 @@ class TongueApp(MDApp):
                     outs.close()
                 except Exception:
                     pass
-            return target if os.path.exists(target) else ""
-        except Exception:
+            # 验证文件是否成功写入
+            if os.path.exists(target) and os.path.getsize(target) > 0:
+                return target
+            return ""
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             return ""
 
     def _required_android_perms_for_capture(self):
@@ -772,9 +781,47 @@ class TongueApp(MDApp):
             act = PythonActivity.mActivity
             if intent.resolveActivity(act.getPackageManager()) is None:
                 return False
+
+            # 创建输出文件 URI，保存完整图片
+            from jnius import cast
+            File = autoclass("java.io.File")
+            Uri = autoclass("android.net.Uri")
+            ContentValues = autoclass("android.content.ContentValues")
+
+            # 创建 captures 目录
+            capture_dir = Path(self.user_data_dir) / "captures"
+            capture_dir.mkdir(parents=True, exist_ok=True)
+
+            # 生成唯一的文件名
+            filename = f"tongue_{int(time.time() * 1000)}.jpg"
+            output_file = File(str(capture_dir), filename)
+
+            # 使用 FileProvider 获取 URI
+            try:
+                # 尝试使用 FileProvider
+                authority = f"{act.getPackageName()}.provider"
+                file_provider = autoclass("androidx.core.content.FileProvider")
+                photo_uri = file_provider.getUriForFile(act, authority, output_file)
+            except Exception:
+                # 如果 FileProvider 不可用，尝试直接创建 URI
+                photo_uri = Uri.fromFile(output_file)
+
+            # 设置输出 URI
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, photo_uri)
+
+            # 授予临时写入权限
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+            # 保存 URI 供后续使用
+            self._camera_output_uri = str(photo_uri.toString())
+            self._camera_output_path = str(output_file.getAbsolutePath())
+
             act.startActivityForResult(intent, self._camera_request_code)
             return True
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             return False
 
     def _start_android_gallery_intent(self) -> bool:
@@ -854,20 +901,43 @@ class TongueApp(MDApp):
 
     def _stage_image_for_upload(self, source_path: str) -> str:
         """统一把待上传图片落地到 app 私有目录，避免临时路径/URI 失效。"""
-        local = self._ensure_local_image_path(source_path)
-        if not local or not os.path.exists(local):
+        if not source_path:
             return ""
+
+        # 首先确保图片在本地可访问
+        local = self._ensure_local_image_path(source_path)
+        if not local:
+            import traceback
+            traceback.print_exc()
+            return ""
+
+        if not os.path.exists(local):
+            return ""
+
+        # 检查文件大小
+        file_size = os.path.getsize(local)
+        if file_size <= 0:
+            return ""
+
         try:
             src = Path(local)
             suffix = src.suffix.lower() if src.suffix else ".jpg"
             upload_dir = Path(self.user_data_dir) / "uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
             staged = upload_dir / f"upload_{int(time.time() * 1000)}{suffix}"
-            shutil.copy2(str(src), str(staged))
+
+            # 使用二进制模式复制文件，确保数据完整性
+            with open(str(src), 'rb') as f_src:
+                with open(str(staged), 'wb') as f_dst:
+                    shutil.copyfileobj(f_src, f_dst, length=8192)  # 使用 8KB 缓冲区
+
+            # 验证复制结果
             if staged.exists() and staged.stat().st_size > 0:
                 return str(staged)
             return ""
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             return ""
 
     def _apply_android_camera_result(self, result_code: int, intent):
@@ -877,17 +947,30 @@ class TongueApp(MDApp):
             ok = int(result_code) == int(Activity.RESULT_OK)
         except Exception:
             ok = False
-        if not ok or intent is None:
+        if not ok:
             self._snack("拍照取消或失败")
             return
-        path = self._save_camera_thumb_from_intent(intent)
-        if not path:
-            self._snack("拍照结果读取失败，请改用选图")
+
+        # 优先使用预先设置的输出路径
+        path = getattr(self, "_camera_output_path", "")
+        if path and os.path.exists(path) and os.path.getsize(path) > 0:
+            self.selected_image_path = path
+            self.has_image_preview = True
+            self._update_analyze_button()
+            self._snack("拍照成功，已加载图片")
             return
-        self.selected_image_path = path
-        self.has_image_preview = True
-        self._update_analyze_button()
-        self._snack("拍照成功，已加载图片")
+
+        # 如果预设路径失败，尝试从 Intent 获取缩略图
+        if intent is not None:
+            path = self._save_camera_thumb_from_intent(intent)
+            if path:
+                self.selected_image_path = path
+                self.has_image_preview = True
+                self._update_analyze_button()
+                self._snack("拍照成功，已加载图片")
+                return
+
+        self._snack("拍照结果读取失败，请改用选图")
 
     def _save_camera_thumb_from_intent(self, intent) -> str:
         if platform != "android" or autoclass is None or intent is None:
@@ -1048,18 +1131,32 @@ class TongueApp(MDApp):
     def _on_analyze_failed(self, msg, mode: str = "image"):
         self._set_loading(False)
         lower = msg.lower()
+
+        # 根据错误类型提供友好的错误提示
         if "timed out" in lower or "timeout" in lower:
             friendly = "请求超时：模型处理时间较长或网络不稳定，请稍后重试。"
         elif "401" in lower or "403" in lower:
             friendly = "鉴权失败：请检查 app_config.json 的 api_token 是否正确。"
         elif "404" in lower:
             friendly = "接口不存在：请检查 api_base_url 与 api_path 配置。"
+        elif "file not found" in lower or "file empty" in lower:
+            friendly = "图片文件读取失败：请重新选择或拍摄图片后再试。"
+        elif "connection" in lower or "network" in lower:
+            friendly = "网络连接失败：请检查网络连接后重试。"
         else:
             friendly = "服务调用失败：请检查服务器状态和网络连接。"
+
+        # 显示简短提示
         self._snack("调用失败")
+
+        # 显示详细错误信息
         prev_scroll_y = self._get_scroll_y()
         if getattr(self, "_assistant_label", None) is not None:
-            self._refresh_message_height(self._assistant_label, f"{friendly}\n\n原始错误: {msg}")
+            # 限制错误信息长度，避免显示过长
+            error_detail = msg if len(msg) <= 500 else msg[:500] + "..."
+            self._refresh_message_height(self._assistant_label, f"{friendly}
+
+原始错误: {error_detail}")
         self._restore_scroll_y(prev_scroll_y)
 
     def _set_loading(self, is_loading: bool, text: str = ""):

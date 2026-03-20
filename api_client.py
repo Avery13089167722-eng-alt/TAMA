@@ -26,6 +26,8 @@ class LLMApiClient:
         user_note: str = "",
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict:
+        import traceback
+
         headers = {}
         if extra_headers:
             headers.update(extra_headers)
@@ -36,17 +38,50 @@ class LLMApiClient:
             "max_new_tokens": "512",
         }
         url = f"{self.base_url}{self.api_path}"
+
+        # 验证文件存在性和大小
         if not os.path.exists(image_path):
-            raise FileNotFoundError(f"image file not found: {image_path}")
-        if os.path.getsize(image_path) <= 0:
-            raise FileNotFoundError(f"image file empty: {image_path}")
+            error_msg = f"image file not found: {image_path}"
+            print(f"[ERROR] {error_msg}")
+            traceback.print_exc()
+            raise FileNotFoundError(error_msg)
+
+        file_size = os.path.getsize(image_path)
+        if file_size <= 0:
+            error_msg = f"image file empty: {image_path}"
+            print(f"[ERROR] {error_msg}")
+            traceback.print_exc()
+            raise FileNotFoundError(error_msg)
+
+        # 检测 MIME 类型
         mime, _ = mimetypes.guess_type(image_path)
         mime = mime or "application/octet-stream"
-        with open(image_path, "rb") as f:
-            files = {"file": (os.path.basename(image_path), f, mime)}
-            resp = requests.post(url, data=form_data, files=files, headers=headers, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
+
+        print(f"[INFO] Uploading image: {image_path}, size: {file_size}, mime: {mime}")
+        print(f"[INFO] API URL: {url}")
+
+        try:
+            with open(image_path, "rb") as f:
+                files = {"file": (os.path.basename(image_path), f, mime)}
+                resp = requests.post(url, data=form_data, files=files, headers=headers, timeout=self.timeout)
+
+            print(f"[INFO] Response status: {resp.status_code}")
+            print(f"[INFO] Response headers: {dict(resp.headers)}")
+
+            resp.raise_for_status()
+            result = resp.json()
+            print(f"[INFO] Response data: {result}")
+            return result
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Request failed: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            traceback.print_exc()
+            raise
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            print(f"[ERROR] {error_msg}")
+            traceback.print_exc()
+            raise
 
     def text_chat(
         self,
