@@ -211,6 +211,8 @@ class TongueApp(MDApp):
         self._camera_request_code = 4721
         self._gallery_request_code = 4722
         self._android_camera_bound = False
+        self._camera_used_pending = False
+        self._camera_thumb_only = False
 
     def _on_mouse_scroll(self, _window, _x, _y, _scroll_x, scroll_y):
         # 桌面端：兜底实现鼠标滚轮上下滚动查看（避免某些环境 ScrollView 不响应）。
@@ -852,6 +854,94 @@ class TongueApp(MDApp):
             self._set_loading(False)
             self._snack("拍照启动失败，请重试")
 
+    def _android_create_camera_destination_uri(self, act):
+        """
+        为系统相机预创建可写入的 Uri。
+        Android 10+ 需 RELATIVE_PATH + IS_PENDING，否则 insert 常返回 null，相机无法启动。
+        返回 (photo_uri_java 或 None, used_is_pending: bool, output_abs_path 或 "").
+        """
+        MediaStore = autoclass("android.provider.MediaStore")
+        ContentValues = autoclass("android.content.ContentValues")
+        MediaColumns = autoclass("android.provider.MediaStore$MediaColumns")
+        Build = autoclass("android.os.Build")
+        Environment = autoclass("android.os.Environment")
+        File = autoclass("java.io.File")
+        resolver = act.getContentResolver()
+        filename = f"tongue_{int(time.time() * 1000)}.jpg"
+        sdk = int(Build.VERSION.SDK_INT)
+        ImagesMedia = autoclass("android.provider.MediaStore$Images$Media")
+        # Android 10+ 推荐使用主存储卷 Uri；旧版沿用 EXTERNAL_CONTENT_URI。
+        if sdk >= 29:
+            try:
+                collection = ImagesMedia.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            except Exception:
+                collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        else:
+            collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+
+        def _try_media_insert(rel_path, is_pending):
+            values = ContentValues()
+            values.put(MediaColumns.DISPLAY_NAME, filename)
+            values.put(MediaColumns.MIME_TYPE, "image/jpeg")
+            if rel_path:
+                values.put(MediaColumns.RELATIVE_PATH, rel_path)
+            if is_pending is not None:
+                values.put(MediaColumns.IS_PENDING, int(is_pending))
+            return resolver.insert(collection, values)
+
+        # 1) Android 10+：标准分区存储写法
+        if sdk >= 29:
+            rel = f"{Environment.DIRECTORY_PICTURES}/ShezhengZhixi"
+            uri = _try_media_insert(rel, 1)
+            if uri is not None:
+                return uri, True, ""
+            uri = _try_media_insert(None, 1)
+            if uri is not None:
+                return uri, True, ""
+
+        # 2) 旧系统：无 IS_PENDING
+        uri = _try_media_insert(None, None)
+        if uri is not None:
+            return uri, False, ""
+
+        # 3) 兜底：应用专属目录 + FileProvider（部分 ROM 上 MediaStore insert 失败）
+        try:
+            ext_dir = act.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+            if ext_dir is not None:
+                base = str(ext_dir.getAbsolutePath())
+            else:
+                base = str(Path(self.user_data_dir) / "captures")
+            Path(base).mkdir(parents=True, exist_ok=True)
+            out_file = File(base, filename)
+            authority = f"{act.getPackageName()}.provider"
+            file_provider = autoclass("androidx.core.content.FileProvider")
+            photo_uri = file_provider.getUriForFile(act, authority, out_file)
+            if photo_uri is not None:
+                return photo_uri, False, str(out_file.getAbsolutePath())
+        except Exception:
+            pass
+
+        return None, False, ""
+
+    def _android_finalize_camera_media_uri(self, act, uri_str: str, used_pending: bool):
+        """拍照成功后清除 IS_PENDING，否则其它应用与本应用读取可能异常。"""
+        if not uri_str or not used_pending:
+            return
+        try:
+            Build = autoclass("android.os.Build")
+            if int(Build.VERSION.SDK_INT) < 29:
+                return
+            Uri = autoclass("android.net.Uri")
+            ContentValues = autoclass("android.content.ContentValues")
+            MediaColumns = autoclass("android.provider.MediaStore$MediaColumns")
+            resolver = act.getContentResolver()
+            uri = Uri.parse(uri_str)
+            cv = ContentValues()
+            cv.put(MediaColumns.IS_PENDING, 0)
+            resolver.update(uri, cv, None, None)
+        except Exception:
+            pass
+
     def _start_android_camera_intent(self) -> bool:
         if platform != "android" or autoclass is None:
             return False
@@ -859,32 +949,37 @@ class TongueApp(MDApp):
             self._bind_android_activity_result()
             Intent = autoclass("android.content.Intent")
             MediaStore = autoclass("android.provider.MediaStore")
+            ClipData = autoclass("android.content.ClipData")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
             act = PythonActivity.mActivity
             if intent.resolveActivity(act.getPackageManager()) is None:
                 return False
-            # 通过 MediaStore 预分配输出 URI，避免 FileProvider 配置缺失导致的相机无法启动。
-            ContentValues = autoclass("android.content.ContentValues")
+
             resolver = act.getContentResolver()
-            values = ContentValues()
-            filename = f"tongue_{int(time.time() * 1000)}.jpg"
-            values.put("_display_name", filename)
-            values.put("mime_type", "image/jpeg")
-            photo_uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            photo_uri, used_pending, out_path = self._android_create_camera_destination_uri(act)
+
+            # 无安全输出 Uri 时仍唤起系统相机（仅缩略图 extras，画质较低但保证能拍）
+            self._camera_used_pending = bool(used_pending)
+            self._camera_thumb_only = False
             if photo_uri is None:
-                return False
+                self._camera_output_uri = ""
+                self._camera_output_path = ""
+                self._camera_used_pending = False
+                self._camera_thumb_only = True
+                act.startActivityForResult(intent, self._camera_request_code)
+                return True
 
-            # 设置输出 URI
             intent.putExtra(MediaStore.EXTRA_OUTPUT, photo_uri)
-
-            # 授予临时写入权限
             intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            try:
+                intent.setClipData(ClipData.newUri(resolver, "capture", photo_uri))
+            except Exception:
+                pass
 
-            # 保存 URI；回调时如需要可从 URI 再次落地到本地文件。
             self._camera_output_uri = str(photo_uri.toString())
-            self._camera_output_path = ""
+            self._camera_output_path = out_path or ""
 
             act.startActivityForResult(intent, self._camera_request_code)
             return True
@@ -995,6 +1090,17 @@ class TongueApp(MDApp):
         if not ok:
             self._snack("拍照取消或失败")
             return
+
+        # MediaStore IS_PENDING 需在写入完成后清零
+        try:
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            act = PythonActivity.mActivity
+            uri_str = getattr(self, "_camera_output_uri", "") or ""
+            used_p = getattr(self, "_camera_used_pending", False)
+            if uri_str and used_p:
+                self._android_finalize_camera_media_uri(act, uri_str, True)
+        except Exception:
+            pass
 
         # 优先使用预先设置的输出路径
         path = getattr(self, "_camera_output_path", "")
