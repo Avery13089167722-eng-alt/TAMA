@@ -1154,9 +1154,10 @@ class TongueApp(MDApp):
         if getattr(self, "_assistant_label", None) is not None:
             # 限制错误信息长度，避免显示过长
             error_detail = msg if len(msg) <= 500 else msg[:500] + "..."
-            self._refresh_message_height(self._assistant_label, f"{friendly}
-
-原始错误: {error_detail}")
+            self._refresh_message_height(
+                self._assistant_label,
+                f"{friendly}\n\n原始错误: {error_detail}",
+            )
         self._restore_scroll_y(prev_scroll_y)
 
     def _set_loading(self, is_loading: bool, text: str = ""):
