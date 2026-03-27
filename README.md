@@ -1,5 +1,6 @@
 舌征智析手机端TAMA
 
+
 这是一个可打包为 Android APK 的舌象分析应用：
 手机端从相册选择舌象图上传
 调用云端大模型做中医分析
@@ -23,7 +24,7 @@ Android 真机相册选图与聊天展示
 `app_config.json`：接口配置
 `requirements.txt`：依赖
 
- API对接（已对接你的服务器）
+API对接（已对接你的服务器）
 客户端请求（POST）：
 URL：`{api_base_url}{api_path}`，默认`http://8.160.184.31:8001/v1/tongue-analyze`
 Header:
@@ -72,7 +73,7 @@ pip install buildozer cython
 buildozer -v android debug
 ```
 
-生成后 APK 在 `bin/` 目录，可直接安装到其他 Android 设备。
+生成后的 APK 存储在`bin/`目录，可直接安装到其他 Android 设备。
 
 6. 可移植性说明
 应用数据存储在设备本地数据库 `tongue_records.db`
